@@ -42,3 +42,18 @@ fig_corr, ax_corr = plt.subplots(figsize=(8,6))
 sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', fmt=".2f", ax=ax_corr)
 ax_corr.set_title("Mapa de calor de correlaciones")
 st.pyplot(fig_corr)
+
+# Distribución de cada variable numérica
+st.subheader("Distribución de variables numéricas")
+for col in ['Ciudad_code', 'Total', 'Cluster']:
+    fig_dist, ax_dist = plt.subplots()
+    sns.histplot(client_sales[col], kde=True, ax=ax_dist)
+    ax_dist.set_title(f"Distribución de {col}")
+    st.pyplot(fig_dist)
+
+# Pairplot para relaciones entre variables numéricas
+st.subheader("Relaciones entre variables numéricas")
+pairplot_fig = sns.pairplot(client_sales[['Ciudad_code', 'Total', 'Cluster']], hue='Cluster', palette='Set2')
+st.pyplot(pairplot_fig.fig)
+
+
