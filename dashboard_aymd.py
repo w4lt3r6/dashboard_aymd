@@ -56,4 +56,20 @@ st.subheader("Relaciones entre variables numéricas")
 pairplot_fig = sns.pairplot(client_sales[['Ciudad_code', 'Total', 'Cluster']], hue='Cluster', palette='Set2')
 st.pyplot(pairplot_fig.fig)
 
+# Diagramas de bigotes (boxplot)
+st.subheader("Diagramas de bigotes por variable numérica")
+for col in ['Ciudad_code', 'Total']:
+    fig_box, ax_box = plt.subplots()
+    sns.boxplot(data=client_sales, x='Cluster', y=col, ax=ax_box)
+    ax_box.set_title(f"Boxplot de {col} por Cluster")
+    st.pyplot(fig_box)
+
+# Diagramas de violín (violinplot)
+st.subheader("Diagramas de violín por variable numérica")
+for col in ['Ciudad_code', 'Total']:
+    fig_violin, ax_violin = plt.subplots()
+    sns.violinplot(data=client_sales, x='Cluster', y=col, palette='Set2', ax=ax_violin)
+    ax_violin.set_title(f"Violinplot de {col} por Cluster")
+    st.pyplot(fig_violin)
+
 
