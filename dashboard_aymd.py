@@ -5,7 +5,7 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 
 # Cargar datos
-df = pd.read_excel("Base-2023-AYMD-OpenRefine (1) 2", engine="openpyxl")
+df = pd.read_excel("Base-2023-AYMD-OpenRefine (1) 2.xlsx", engine="openpyxl")
 df['Ciudad'] = df['Ciudad'].str.strip().str.lower()
 
 # Agrupar por cliente y ciudad
