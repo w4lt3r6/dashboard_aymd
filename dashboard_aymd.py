@@ -11,14 +11,20 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import xgboost as xgb
 
 # ---------------------------------------------------------------------
-# Helpers para manejar fechas con strings y seriales de Excel
+# Configuración visual
+# ---------------------------------------------------------------------
+st.set_page_config(page_title="Dashboard AYMD", layout="wide")
+sns.set(style="whitegrid")
+
+# ---------------------------------------------------------------------
+# Helper para fechas (maneja strings y seriales de Excel)
 # ---------------------------------------------------------------------
 def parse_fecha(series: pd.Series) -> pd.Series:
     s = series.copy()
-    # 1) Intento de parseo estándar con día primero (formato latino)
+    # 1) Parseo estándar con día primero (formato latino)
     s_dt = pd.to_datetime(s, errors='coerce', dayfirst=True)
-    # 2) Si quedaron NaT y el valor original es numérico, asumir serial Excel
-    #    Excel usa origen '1899-12-30' para días.
+
+    # 2) Donde quedó NaT y el original es numérico, asumir serial Excel (origen 1899-12-30)
     mask_num = s_dt.isna() & s.apply(lambda x: isinstance(x, (int, float)))
     if mask_num.any():
         s_dt.loc[mask_num] = pd.to_datetime(s[mask_num], unit='D', origin='1899-12-30', errors='coerce')
@@ -37,40 +43,38 @@ for col in ['Ciudad', 'Vendedor', 'Nombre cliente']:
 df['Fecha'] = parse_fecha(df['Fecha'])
 
 # Derivados de tiempo por fila
-# Si alguna fecha es NaT, rellenamos mes/trimestre con la moda del conjunto
 mes_series = df['Fecha'].dt.month
 tri_series = ((mes_series - 1) // 3 + 1)
+
+# Rellenos con moda si faltan
 if mes_series.isna().any():
     moda_mes = mes_series.dropna().mode()
     moda_mes = int(moda_mes.iloc[0]) if len(moda_mes) else 1
     mes_series = mes_series.fillna(moda_mes)
+
 if tri_series.isna().any():
     moda_tri = tri_series.dropna().mode()
     moda_tri = int(moda_tri.iloc[0]) if len(moda_tri) else 1
     tri_series = tri_series.fillna(moda_tri)
+
 df['mes'] = mes_series.astype(int)
 df['trimestre'] = tri_series.astype(int)
 
 # ---------------------------------------------------------------------
-# Segmentación (tab 1) - KMeans por ciudad y total
+# Segmentación (Tab 1) - KMeans por ciudad y total
 # ---------------------------------------------------------------------
 client_sales = (
     df.groupby(['Nombre cliente', 'Ciudad'], as_index=False)['Total']
       .sum()
 )
-
-# Codificar Ciudad para el scatter (solo para visualización/cluster)
 client_sales['Ciudad_code'] = client_sales['Ciudad'].astype('category').cat.codes
 
-# Clustering
-X_cluster = client_sales[['Ciudad_code', 'Total']]
-kmeans = KMeans(n_clusters=4, random_state=42)
-client_sales['Cluster'] = kmeans.fit_predict(X_cluster)
+kmeans = KMeans(n_clusters=4, random_state=42, n_init=10)
+client_sales['Cluster'] = kmeans.fit_predict(client_sales[['Ciudad_code', 'Total']])
 
 # ---------------------------------------------------------------------
-# Features agregadas a nivel cliente (RFM-like)
+# Agregados RFM a nivel cliente
 # ---------------------------------------------------------------------
-# Frecuencia, total, ticket promedio, desviación del ticket y última fecha por cliente
 agg = df.groupby('Nombre cliente').agg(
     total_cliente=('Total', 'sum'),
     freq_compra=('Total', 'count'),
@@ -86,67 +90,90 @@ ciudad_principal = (
       .reset_index()
       .rename(columns={'Ciudad': 'ciudad_principal'})
 )
-
 agg = agg.merge(ciudad_principal, on='Nombre cliente', how='left')
 
-# Recencia: días desde la última compra del cliente hasta la última fecha en la base
+# Recencia en días (hasta la última fecha de la base)
 fecha_ref = df['Fecha'].max()
 agg['recencia_dias'] = (fecha_ref - agg['ultima_fecha']).dt.days
-# Rellenos por si hay NaN
+
+# Rellenos de NaN en agregados
 agg['std_ticket'] = agg['std_ticket'].fillna(0)
 agg['recencia_dias'] = agg['recencia_dias'].fillna(agg['recencia_dias'].median())
 
 # Mes y trimestre del último registro del cliente (para predicción por cliente)
-agg['mes_ultimo'] = agg['ultima_fecha'].dt.month.fillna(df['mes'].mode().iloc[0])
+agg['mes_ultimo'] = agg['ultima_fecha'].dt.month
+# Si faltó, usa la moda global
+if agg['mes_ultimo'].isna().any():
+    moda_mes_global = df['mes'].mode()
+    moda_mes_global = int(moda_mes_global.iloc[0]) if len(moda_mes_global) else 1
+    agg['mes_ultimo'] = agg['mes_ultimo'].fillna(moda_mes_global)
 agg['tri_ultimo'] = ((agg['mes_ultimo'] - 1) // 3 + 1).astype(int)
 
 # ---------------------------------------------------------------------
-# Construcción del dataset de modelado (unimos agregados por cliente)
+# Construcción del dataset de modelado (robusto)
 # ---------------------------------------------------------------------
-df_model = df.merge(agg[['Nombre cliente', 'ciudad_principal', 'total_cliente',
-                         'freq_compra', 'ticket_promedio', 'std_ticket',
-                         'recencia_dias']],
-                    on='Nombre cliente', how='left')
+df_model = df.merge(
+    agg[['Nombre cliente', 'ciudad_principal', 'total_cliente',
+         'freq_compra', 'ticket_promedio', 'std_ticket',
+         'recencia_dias', 'mes_ultimo', 'tri_ultimo']],
+    on='Nombre cliente', how='left'
+)
 
-# One-hot encoding de categóricas (usamos variables de fila y agregadas)
-# - Nombre cliente (clave principal de la UI)
-# - Ciudad de la fila (mayor granularidad)
-# - Mes y trimestre de la fila (estacionalidad)
+# One-hot encoding de categóricas (fila y tiempo)
 df_encoded = pd.get_dummies(
     df_model[['Nombre cliente', 'Ciudad', 'mes', 'trimestre']],
-    columns=['Nombre cliente', 'Ciudad', 'mes', 'trimestre']
+    columns=['Nombre cliente', 'Ciudad', 'mes', 'trimestre'],
+    dtype=float  # fuerza columnas numéricas
 )
 
-# Variables numéricas agregadas (RFM)
+# Numéricas agregadas (RFM)
 numericas = df_model[['total_cliente', 'freq_compra', 'ticket_promedio',
-                      'std_ticket', 'recencia_dias']].reset_index(drop=True)
+                      'std_ticket', 'recencia_dias']].copy()
 
-# X final
-X = pd.concat([df_encoded.reset_index(drop=True), numericas], axis=1)
+# Relleno de NaN en numéricas con la mediana
+for c in numericas.columns:
+    if numericas[c].isna().any():
+        numericas[c] = numericas[c].fillna(numericas[c].median())
+
+# X final y saneo
+X = pd.concat([df_encoded.reset_index(drop=True),
+               numericas.reset_index(drop=True)], axis=1)
+
+# Sustituye Inf/-Inf y NaN, fuerza float
+X = X.replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(float)
+
+# y (objetivo)
 y = df_model['Total'].astype(float)
+y = y.replace([np.inf, -np.inf], np.nan).fillna(y.median())
 
-# Train/Test split y entrenamiento con early stopping
+# Split con numpy arrays (evita problemas de índices en xgboost)
 X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.20, random_state=42
+    X.values,
+    y.values,
+    test_size=0.20,
+    random_state=42
 )
 
+# ---------------------------------------------------------------------
+# Modelo XGBoost con early stopping y métrica explícita
+# ---------------------------------------------------------------------
 model = xgb.XGBRegressor(
     random_state=42,
     verbosity=0,
     n_estimators=2000,        # más árboles pero frenados por early stopping
     max_depth=6,
-    learning_rate=0.03,       # tasa más baja para generalizar mejor
+    learning_rate=0.03,       # tasa baja para generalizar
     subsample=0.9,
     colsample_bytree=0.9,
     reg_alpha=0.0,
     reg_lambda=1.0,
-    tree_method='hist'        # rápido y estable
+    tree_method='hist'
 )
 
-# Early stopping: se detiene si no mejora 100 iteraciones
 model.fit(
     X_train, y_train,
     eval_set=[(X_test, y_test)],
+    eval_metric='rmse',
     verbose=False,
     early_stopping_rounds=100
 )
@@ -225,12 +252,12 @@ with tab2:
     st.write(f"**RMSE:** ${rmse:,.2f}")
     st.write(f"**R²:** {r2_score(y_test, y_pred):.2f}")
     st.caption(
-        "El modelo ahora usa ciudad, mes, trimestre y agregados RFM por cliente. "
-        "Entrenado con early stopping para evitar sobreajuste."
+        "El modelo usa ciudad, mes, trimestre y agregados RFM por cliente; entrenado con early stopping."
     )
 
     # ----------------- Predicción personalizada (solo Cliente) -----------------
     st.subheader("Predicción personalizada")
+
     clientes = sorted(df['Nombre cliente'].dropna().unique())
     if len(clientes) == 0:
         st.warning("No hay clientes en la base para realizar predicciones.")
@@ -238,22 +265,29 @@ with tab2:
 
     cliente_input = st.selectbox("Cliente:", clientes, key="sel_cliente")
 
-    # Tomamos agregados del cliente seleccionado
+    # Buscar agregados del cliente seleccionado (con fallbacks)
+    if cliente_input not in agg['Nombre cliente'].values:
+        st.warning("No se encontraron agregados para el cliente seleccionado.")
+        st.stop()
+
     agg_row = agg[agg['Nombre cliente'] == cliente_input].iloc[0]
 
-    # Inferimos ciudad principal y mes/trimestre del último registro del cliente
-    ciudad_pred = str(agg_row['ciudad_principal'])
-    mes_pred = int(agg_row['mes_ultimo'])
-    tri_pred = int(agg_row['tri_ultimo'])
+    # Inferir ciudad principal con fallback a la moda global si es NaN
+    ciudad_pred = str(agg_row['ciudad_principal']) if pd.notna(agg_row['ciudad_principal']) else None
+    if not ciudad_pred or ciudad_pred == 'nan':
+        moda_ciudad_global = df['Ciudad'].mode()
+        ciudad_pred = str(moda_ciudad_global.iloc[0]) if len(moda_ciudad_global) else 'mosquera'
 
-    # Construir vector de entrada (one-hot) consistente con X.columns
+    # Mes y trimestre del último registro del cliente (ya calculados; con fallback)
+    mes_pred = int(agg_row['mes_ultimo']) if pd.notna(agg_row['mes_ultimo']) else int(df['mes'].mode().iloc[0])
+    tri_pred = int(agg_row['tri_ultimo']) if pd.notna(agg_row['tri_ultimo']) else int(df['trimestre'].mode().iloc[0])
+
+    # Construir vector de entrada (one-hot + RFM) consistente con X.columns
     input_dict = {
-        # One-hot de cliente, ciudad, mes, trimestre
-        f"Nombre cliente_{cliente_input}": 1,
-        f"Ciudad_{ciudad_pred}": 1,
-        f"mes_{mes_pred}": 1,
-        f"trimestre_{tri_pred}": 1,
-        # Numéricas agregadas
+        f"Nombre cliente_{cliente_input}": 1.0,
+        f"Ciudad_{ciudad_pred}": 1.0,
+        f"mes_{mes_pred}": 1.0,
+        f"trimestre_{tri_pred}": 1.0,
         "total_cliente": float(agg_row['total_cliente']),
         "freq_compra": float(agg_row['freq_compra']),
         "ticket_promedio": float(agg_row['ticket_promedio']),
@@ -261,17 +295,11 @@ with tab2:
         "recencia_dias": float(agg_row['recencia_dias']),
     }
 
-    # Vector con todas las columnas del entrenamiento
-    input_vector = pd.DataFrame([input_dict]).reindex(columns=X.columns, fill_value=0)
+    input_vector = pd.DataFrame([input_dict]).reindex(columns=X.columns, fill_value=0.0)
 
-    # Predicción
-    predicted_total = float(model.predict(input_vector)[0])
-
+    # Predicción (usar .values para mayor compatibilidad)
+    predicted_total = float(model.predict(input_vector.values)[0])
     st.write(f"### Monto estimado: ${predicted_total:,.2f}")
-    st.caption(
-        "Para la predicción, se usó la ciudad principal y el mes/trimestre del último registro del cliente, "
-        "además de sus agregados históricos (frecuencia, ticket promedio, total, desviación, recencia)."
-    )
 
     # ----------------- Importancia de variables -----------------
     st.subheader("Importancia de variables")
@@ -284,3 +312,14 @@ with tab2:
     sns.barplot(data=importance_df.head(20), x="Importance", y="Feature", ax=ax_imp)
     ax_imp.set_title("Top 20 variables más importantes")
     st.pyplot(fig_imp)
+
+    # ----------------- Diagnóstico rápido -----------------
+    with st.expander("Diagnóstico (si algo falla)"):
+        st.write("X shape:", X.shape)
+        st.write("y shape:", y.shape)
+        st.write("¿Hay NaN en X?", np.isnan(X.values).any())
+        st.write("¿Hay NaN en y?", np.isnan(y.values).any())
+        st.write("¿Hay Inf en X?", np.isinf(X.values).any())
+        st.write("¿Hay Inf en y?", np.isinf(y.values).any())
+        st.write("Primeras 10 columnas de X:", list(X.columns[:10]))
+        st.write("Mejor iteración del modelo:", getattr(model, "best_iteration", None))
