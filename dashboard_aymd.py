@@ -6,8 +6,8 @@ import seaborn as sns
 import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.cluster import KMeans
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split
 import xgboost as xgb
 
 # ---------------------------------------------------------------------
@@ -58,6 +58,10 @@ if tri_series.isna().any():
 
 df['mes'] = mes_series.astype(int)
 df['trimestre'] = tri_series.astype(int)
+
+# ---------------- Mes cíclico (captura continuidad dic-ene) --------------
+df['mes_sin'] = np.sin(2 * np.pi * df['mes'] / 12.0)
+df['mes_cos'] = np.cos(2 * np.pi * df['mes'] / 12.0)
 
 # ---------------------------------------------------------------------
 # Segmentación (Tab 1) - KMeans por ciudad y total
@@ -118,16 +122,16 @@ df_model = df.merge(
     on='Nombre cliente', how='left'
 )
 
-# One-hot encoding de categóricas (fila y tiempo)
+# One-hot encoding de categóricas (quitamos 'mes' one-hot: usamos mes_sin/mes_cos)
 df_encoded = pd.get_dummies(
-    df_model[['Nombre cliente', 'Ciudad', 'mes', 'trimestre']],
-    columns=['Nombre cliente', 'Ciudad', 'mes', 'trimestre'],
-    dtype=float  # fuerza columnas numéricas
+    df_model[['Nombre cliente', 'Ciudad', 'trimestre']],
+    columns=['Nombre cliente', 'Ciudad', 'trimestre'],
+    dtype=float
 )
 
-# Numéricas agregadas (RFM)
+# Numéricas agregadas (RFM) + mes cíclico
 numericas = df_model[['total_cliente', 'freq_compra', 'ticket_promedio',
-                      'std_ticket', 'recencia_dias']].copy()
+                      'std_ticket', 'recencia_dias', 'mes_sin', 'mes_cos']].copy()
 
 # Relleno de NaN en numéricas con la mediana
 for c in numericas.columns:
@@ -142,14 +146,26 @@ X = X.replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(float)
 # y (objetivo): transformamos con log1p para estabilizar
 y = df_model['Total'].astype(float)
 y = y.replace([np.inf, -np.inf], np.nan).fillna(y.median())
-y_log = np.log1p(y)  # log(1 + y)
+y_log = np.log1p(y)  # log(1 + y) para entrenamiento
 
 # ---------------------------------------------------------------------
-# Split y ENTRENAMIENTO con API nativa de XGBoost (DMatrix + train)
+# VALIDACIÓN TEMPORAL (train antes de 1/oct/2023; test desde 1/oct/2023)
 # ---------------------------------------------------------------------
-X_train_df, X_test_df, y_train_s, y_test_s = train_test_split(
-    X, y_log, test_size=0.20, random_state=42  # entrenamos en escala log
-)
+cutoff = pd.to_datetime("2023-10-01")
+# df_model['Fecha'] existe porque proviene de df en el merge
+train_idx = df_model['Fecha'] < cutoff
+test_idx  = df_model['Fecha'] >= cutoff
+
+# Seguridad: si por algún motivo no hay test, hacemos split aleatorio
+if test_idx.sum() == 0 or train_idx.sum() == 0:
+    st.warning("No hay suficientes datos para validación temporal; usando split aleatorio 80/20.")
+    # Split aleatorio sobre y_log
+    X_train_df, X_test_df, y_train_s, y_test_s = train_test_split(
+        X, y_log, test_size=0.20, random_state=42
+    )
+else:
+    X_train_df, X_test_df = X.loc[train_idx], X.loc[test_idx]
+    y_train_s, y_test_s   = y_log.loc[train_idx], y_log.loc[test_idx]
 
 # Convertir a float32 contiguo
 X_train = np.ascontiguousarray(X_train_df.values, dtype=np.float32)
@@ -162,16 +178,18 @@ feature_names = list(X.columns)
 dtrain = xgb.DMatrix(X_train, label=y_train, feature_names=feature_names)
 dvalid = xgb.DMatrix(X_test,  label=y_test_log, feature_names=feature_names)
 
-# Parámetros del booster (robustos y compatibles)
+# ---------------------------------------------------------------------
+# Booster (API nativa) con TUNING CONSERVADOR y early stopping
+# ---------------------------------------------------------------------
 params = {
     "objective": "reg:squarederror",  # sobre y_log
     "eval_metric": "rmse",
-    "eta": 0.05,                 # learning_rate
-    "max_depth": 6,
+    "eta": 0.04,                 # learning_rate más bajo
+    "max_depth": 5,              # menor profundidad para generalizar mejor
     "subsample": 0.9,
     "colsample_bytree": 0.9,
-    "lambda": 1.0,               # L2
-    "alpha": 0.0,                # L1
+    "lambda": 2.0,               # mayor regularización L2
+    "min_child_weight": 3.0,     # evita splits con poco soporte
     "tree_method": "hist",
     "nthread": 1,
     "seed": 42
@@ -179,20 +197,19 @@ params = {
 
 evals = [(dtrain, "train"), (dvalid, "valid")]
 
-# Entrenamiento con early stopping en escala log
 booster = xgb.train(
     params=params,
     dtrain=dtrain,
-    num_boost_round=800,
+    num_boost_round=1200,          # más rondas; se frenan por early stopping
     evals=evals,
-    early_stopping_rounds=50,
+    early_stopping_rounds=70,
     verbose_eval=False
 )
 
 # ---------------------------------------------------------------------
 # UI - Pestañas
 # ---------------------------------------------------------------------
-tab1, tab2 = st.tabs(["Segmentación de Clientes", "Predicción con XGBoost (Mejorado - Log Target)"])
+tab1, tab2 = st.tabs(["Segmentación de Clientes", "Predicción con XGBoost (Versión A)"])
 
 # ============================== TAB 1 ==============================
 with tab1:
@@ -253,21 +270,21 @@ with tab1:
 
 # ============================== TAB 2 ==============================
 with tab2:
-    st.title("Predicción del Monto de Compra con XGBoost (Objetivo Logarítmico)")
+    st.title("Predicción del Monto de Compra (Validación Temporal + Mes Cíclico)")
 
     # ----------------- Métricas del modelo -----------------
-    # Predicciones en escala log y luego invertimos a pesos
-    y_pred_log = booster.predict(dvalid)
-    y_pred = np.expm1(y_pred_log)             # invierte log1p -> pesos
-    y_test = np.expm1(y_test_log)             # invierte el y_test_log -> pesos reales
+    y_pred_log = booster.predict(dvalid)         # predicciones en escala log
+    y_pred = np.expm1(y_pred_log)                # invertimos a pesos
+    y_test = np.expm1(y_test_log)                # valores reales en pesos
 
     rmse = float(np.sqrt(np.mean((y_test - y_pred) ** 2)))
     st.subheader("Evaluación del modelo")
-    st.write(f"**MAE:** ${mean_absolute_error(y_test, y_pred):,.2f}")
-    st.write(f"**RMSE:** ${rmse:,.2f}")
-    st.write(f"**R²:** {r2_score(y_test, y_pred):.2f}")
+    st.write(f"**MAE (en pesos):** ${mean_absolute_error(y_test, y_pred):,.2f}")
+    st.write(f"**RMSE (en pesos):** ${rmse:,.2f}")
+    st.write(f"**R² (en pesos):** {r2_score(y_test, y_pred):.2f}")
     st.caption(
-        "Entrenado sobre log(1 + Total) para estabilizar la distribución; las métricas se reportan en pesos tras invertir la transformación."
+        "Validación temporal (train < 2023-10-01; test >= 2023-10-01). "
+        "Objetivo entrenado en log(1 + Total); métricas reportadas en pesos."
     )
 
     # ----------------- Predicción personalizada (solo Cliente) -----------------
@@ -297,17 +314,22 @@ with tab2:
     mes_pred = int(agg_row['mes_ultimo']) if pd.notna(agg_row['mes_ultimo']) else int(df['mes'].mode().iloc[0])
     tri_pred = int(agg_row['tri_ultimo']) if pd.notna(agg_row['tri_ultimo']) else int(df['trimestre'].mode().iloc[0])
 
-    # Construir vector de entrada (one-hot + RFM) consistente con X.columns
+    # Mes cíclico para el cliente
+    mes_sin_pred = float(np.sin(2 * np.pi * mes_pred / 12.0))
+    mes_cos_pred = float(np.cos(2 * np.pi * mes_pred / 12.0))
+
+    # Construir vector de entrada (one-hot + RFM + mes cíclico) consistente con feature_names
     input_dict = {
         f"Nombre cliente_{cliente_input}": 1.0,
         f"Ciudad_{ciudad_pred}": 1.0,
-        f"mes_{mes_pred}": 1.0,
         f"trimestre_{tri_pred}": 1.0,
         "total_cliente": float(agg_row['total_cliente']),
         "freq_compra": float(agg_row['freq_compra']),
         "ticket_promedio": float(agg_row['ticket_promedio']),
         "std_ticket": float(agg_row['std_ticket']),
         "recencia_dias": float(agg_row['recencia_dias']),
+        "mes_sin": mes_sin_pred,
+        "mes_cos": mes_cos_pred,
     }
 
     input_vector = pd.DataFrame([input_dict]).reindex(columns=feature_names, fill_value=0.0)
@@ -321,7 +343,7 @@ with tab2:
 
     # ----------------- Importancia de variables -----------------
     st.subheader("Importancia de variables")
-    score = booster.get_score(importance_type='gain')
+    score = booster.get_score(importance_type='gain')  # dict: {feature_name: score}
     if len(score) == 0:
         st.info("La importancia de variables no está disponible en este booster.")
     else:
@@ -337,6 +359,8 @@ with tab2:
 
     # ----------------- Diagnóstico rápido -----------------
     with st.expander("Diagnóstico (si algo falla)"):
+        st.write("Filas train:", int(train_idx.sum()) if 'train_idx' in locals() else 'N/A')
+        st.write("Filas test:", int(test_idx.sum()) if 'test_idx' in locals() else 'N/A')
         st.write("X shape:", X.shape)
         st.write("y (Total) shape:", y.shape)
         st.write("¿Hay NaN en X?", np.isnan(X.values).any())
@@ -345,4 +369,3 @@ with tab2:
         st.write("¿Hay Inf en y?", np.isinf(y.values).any())
         st.write("Primeras 10 columnas de X:", list(X.columns[:10]))
         st.write("Mejor iteración (early stopping):", booster.best_iteration)
-        st.write("Mejor puntuación (RMSE valid, escala log):", booster.best_score)
