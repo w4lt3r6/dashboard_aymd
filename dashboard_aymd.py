@@ -161,7 +161,7 @@ X_test  = np.ascontiguousarray(X_test,  dtype=np.float32)
 y_train = np.ascontiguousarray(y_train, dtype=np.float32)
 y_test  = np.ascontiguousarray(y_test,  dtype=np.float32)
 
-# Modelo XGBoost con parámetros conservadores y n_jobs=1
+# Modelo XGBoost con eval_metric en el CONSTRUCTOR y n_jobs=1
 model = xgb.XGBRegressor(
     random_state=42,
     verbosity=0,
@@ -173,34 +173,17 @@ model = xgb.XGBRegressor(
     reg_alpha=0.0,
     reg_lambda=1.0,
     tree_method='hist',
-    n_jobs=1                 # evita conflictos de hilos en algunos entornos
+    n_jobs=1,
+    eval_metric='rmse'       # ✅ aquí en el constructor (no en fit)
 )
 
-# Entrenamiento con early stopping (envuelto en try/except)
-try:
-    model.fit(
-        X_train, y_train,
-        eval_set=[(X_test, y_test)],
-        eval_metric='rmse',
-        verbose=False,
-        early_stopping_rounds=50
-    )
-except Exception as e:
-    st.warning(f"Entrenamiento con early_stopping falló: {e}. Entrenando sin early_stopping...")
-    model = xgb.XGBRegressor(
-        random_state=42,
-        verbosity=0,
-        n_estimators=800,
-        max_depth=6,
-        learning_rate=0.05,
-        subsample=0.9,
-        colsample_bytree=0.9,
-        reg_alpha=0.0,
-        reg_lambda=1.0,
-        tree_method='hist',
-        n_jobs=1
-    )
-    model.fit(X_train, y_train, verbose=False)
+# Entrenamiento con early stopping
+model.fit(
+    X_train, y_train,
+    eval_set=[(X_test, y_test)],
+    verbose=False,
+    early_stopping_rounds=50  # ✅ se mantiene en fit
+)
 
 # ---------------------------------------------------------------------
 # UI - Pestañas
@@ -276,7 +259,7 @@ with tab2:
     st.write(f"**RMSE:** ${rmse:,.2f}")
     st.write(f"**R²:** {r2_score(y_test, y_pred):.2f}")
     st.caption(
-        "El modelo usa ciudad, mes, trimestre y agregados RFM por cliente; entrenado con early stopping (o sin él si el entorno no lo soporta)."
+        "El modelo usa ciudad, mes, trimestre y agregados RFM por cliente; entrenado con early stopping."
     )
 
     # ----------------- Predicción personalizada (solo Cliente) -----------------
