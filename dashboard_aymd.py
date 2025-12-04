@@ -137,35 +137,34 @@ for c in numericas.columns:
 # X final y saneo
 X = pd.concat([df_encoded.reset_index(drop=True),
                numericas.reset_index(drop=True)], axis=1)
-
-# Sustituye Inf/-Inf y NaN, fuerza float
 X = X.replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(float)
 
-# y (objetivo)
+# y (objetivo): transformamos con log1p para estabilizar
 y = df_model['Total'].astype(float)
 y = y.replace([np.inf, -np.inf], np.nan).fillna(y.median())
+y_log = np.log1p(y)  # log(1 + y)
 
 # ---------------------------------------------------------------------
 # Split y ENTRENAMIENTO con API nativa de XGBoost (DMatrix + train)
 # ---------------------------------------------------------------------
 X_train_df, X_test_df, y_train_s, y_test_s = train_test_split(
-    X, y, test_size=0.20, random_state=42
+    X, y_log, test_size=0.20, random_state=42  # entrenamos en escala log
 )
 
 # Convertir a float32 contiguo
 X_train = np.ascontiguousarray(X_train_df.values, dtype=np.float32)
 X_test  = np.ascontiguousarray(X_test_df.values,  dtype=np.float32)
 y_train = np.ascontiguousarray(y_train_s.values,  dtype=np.float32)
-y_test  = np.ascontiguousarray(y_test_s.values,   dtype=np.float32)
+y_test_log = np.ascontiguousarray(y_test_s.values, dtype=np.float32)
 
 # DMatrix con nombres de features (garantiza mapeo consistente)
 feature_names = list(X.columns)
 dtrain = xgb.DMatrix(X_train, label=y_train, feature_names=feature_names)
-dvalid = xgb.DMatrix(X_test,  label=y_test,  feature_names=feature_names)
+dvalid = xgb.DMatrix(X_test,  label=y_test_log, feature_names=feature_names)
 
 # Parámetros del booster (robustos y compatibles)
 params = {
-    "objective": "reg:squarederror",
+    "objective": "reg:squarederror",  # sobre y_log
     "eval_metric": "rmse",
     "eta": 0.05,                 # learning_rate
     "max_depth": 6,
@@ -180,11 +179,11 @@ params = {
 
 evals = [(dtrain, "train"), (dvalid, "valid")]
 
-# Entrenamiento con early stopping vía xgb.train
+# Entrenamiento con early stopping en escala log
 booster = xgb.train(
     params=params,
     dtrain=dtrain,
-    num_boost_round=800,           # similar al n_estimators
+    num_boost_round=800,
     evals=evals,
     early_stopping_rounds=50,
     verbose_eval=False
@@ -193,7 +192,7 @@ booster = xgb.train(
 # ---------------------------------------------------------------------
 # UI - Pestañas
 # ---------------------------------------------------------------------
-tab1, tab2 = st.tabs(["Segmentación de Clientes", "Predicción con XGBoost (Mejorado)"])
+tab1, tab2 = st.tabs(["Segmentación de Clientes", "Predicción con XGBoost (Mejorado - Log Target)"])
 
 # ============================== TAB 1 ==============================
 with tab1:
@@ -254,19 +253,21 @@ with tab1:
 
 # ============================== TAB 2 ==============================
 with tab2:
-    st.title("Predicción del Monto de Compra con XGBoost (Mejorado)")
+    st.title("Predicción del Monto de Compra con XGBoost (Objetivo Logarítmico)")
 
     # ----------------- Métricas del modelo -----------------
-    y_pred = booster.predict(dvalid)
+    # Predicciones en escala log y luego invertimos a pesos
+    y_pred_log = booster.predict(dvalid)
+    y_pred = np.expm1(y_pred_log)             # invierte log1p -> pesos
+    y_test = np.expm1(y_test_log)             # invierte el y_test_log -> pesos reales
+
     rmse = float(np.sqrt(np.mean((y_test - y_pred) ** 2)))
     st.subheader("Evaluación del modelo")
     st.write(f"**MAE:** ${mean_absolute_error(y_test, y_pred):,.2f}")
     st.write(f"**RMSE:** ${rmse:,.2f}")
-    # R² (con numpy/metrics)
     st.write(f"**R²:** {r2_score(y_test, y_pred):.2f}")
     st.caption(
-        "Entrenado con API nativa de XGBoost (DMatrix + train) usando early stopping; "
-        "evita incompatibilidades de la API sklearn."
+        "Entrenado sobre log(1 + Total) para estabilizar la distribución; las métricas se reportan en pesos tras invertir la transformación."
     )
 
     # ----------------- Predicción personalizada (solo Cliente) -----------------
@@ -313,13 +314,14 @@ with tab2:
     input_np = np.ascontiguousarray(input_vector.values, dtype=np.float32)
     dinput = xgb.DMatrix(input_np, feature_names=feature_names)
 
-    predicted_total = float(booster.predict(dinput)[0])
+    # Predicción en escala log y conversión a pesos
+    predicted_total_log = float(booster.predict(dinput)[0])
+    predicted_total = float(np.expm1(predicted_total_log))
     st.write(f"### Monto estimado: ${predicted_total:,.2f}")
 
     # ----------------- Importancia de variables -----------------
     st.subheader("Importancia de variables")
-    # importance_type: 'weight' | 'gain' | 'cover' | 'total_gain' | 'total_cover'
-    score = booster.get_score(importance_type='gain')  # dict: {feature_name: score}
+    score = booster.get_score(importance_type='gain')
     if len(score) == 0:
         st.info("La importancia de variables no está disponible en este booster.")
     else:
@@ -336,11 +338,11 @@ with tab2:
     # ----------------- Diagnóstico rápido -----------------
     with st.expander("Diagnóstico (si algo falla)"):
         st.write("X shape:", X.shape)
-        st.write("y shape:", y.shape)
+        st.write("y (Total) shape:", y.shape)
         st.write("¿Hay NaN en X?", np.isnan(X.values).any())
         st.write("¿Hay NaN en y?", np.isnan(y.values).any())
         st.write("¿Hay Inf en X?", np.isinf(X.values).any())
         st.write("¿Hay Inf en y?", np.isinf(y.values).any())
         st.write("Primeras 10 columnas de X:", list(X.columns[:10]))
         st.write("Mejor iteración (early stopping):", booster.best_iteration)
-        st.write("Mejor puntuación (RMSE valid):", booster.best_score)
+        st.write("Mejor puntuación (RMSE valid, escala log):", booster.best_score)
