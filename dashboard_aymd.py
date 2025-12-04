@@ -36,12 +36,12 @@ kmeans = KMeans(n_clusters=4, random_state=42)
 client_sales['Cluster'] = kmeans.fit_predict(X_cluster)
 
 # ---------------------------------------------------------------------
-# Modelo XGBoost (tab 2) - usando solo Ciudad y Nombre cliente
+# Modelo XGBoost (tab 2) - usando SOLO "Nombre cliente"
 # ---------------------------------------------------------------------
 df_model = df.copy()
 
-# One-hot encoding SOLO para Ciudad y Nombre cliente
-df_encoded = pd.get_dummies(df_model[['Ciudad', 'Nombre cliente']])
+# One-hot encoding SOLO para Nombre cliente
+df_encoded = pd.get_dummies(df_model[['Nombre cliente']])
 
 X = df_encoded
 y = df_model['Total'].astype(float)
@@ -139,29 +139,16 @@ with tab2:
     # ----------------- Predicción personalizada -----------------
     st.subheader("Predicción personalizada")
 
-    # Fuente para la UI: dataframe normalizado (df ya está normalizado)
-    df_ui = df.copy()
-
-    # 1) Selección de Ciudad
-    ciudades = sorted(df_ui['Ciudad'].dropna().unique())
-    ciudad_input = st.selectbox("Ciudad:", ciudades, key="sel_ciudad")
-
-    # Filtrar por ciudad
-    df_city = df_ui[df_ui['Ciudad'] == ciudad_input]
-
-    # 2) Selección de Cliente (en cascada por ciudad)
-    clientes = sorted(df_city['Nombre cliente'].dropna().unique())
+    # Fuente para la UI: df ya está normalizado
+    clientes = sorted(df['Nombre cliente'].dropna().unique())
     if len(clientes) == 0:
-        st.info("No hay clientes para la ciudad seleccionada. Cambia la ciudad.")
+        st.warning("No hay clientes en la base para realizar predicciones.")
         st.stop()
 
     cliente_input = st.selectbox("Cliente:", clientes, key="sel_cliente")
 
     # Construir vector de entrada (one-hot) consistente con X.columns
-    input_dict = {
-        f"Ciudad_{ciudad_input}": 1,
-        f"Nombre cliente_{cliente_input}": 1
-    }
+    input_dict = {f"Nombre cliente_{cliente_input}": 1}
     input_vector = pd.DataFrame([input_dict]).reindex(columns=X.columns, fill_value=0)
 
     # Predicción
