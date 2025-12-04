@@ -23,7 +23,6 @@ def parse_fecha(series: pd.Series) -> pd.Series:
     s = series.copy()
     # 1) Parseo estándar con día primero (formato latino)
     s_dt = pd.to_datetime(s, errors='coerce', dayfirst=True)
-
     # 2) Donde quedó NaT y el original es numérico, asumir serial Excel (origen 1899-12-30)
     mask_num = s_dt.isna() & s.apply(lambda x: isinstance(x, (int, float)))
     if mask_num.any():
@@ -69,6 +68,7 @@ client_sales = (
 )
 client_sales['Ciudad_code'] = client_sales['Ciudad'].astype('category').cat.codes
 
+# KMeans (n_init explícito para evitar warnings)
 kmeans = KMeans(n_clusters=4, random_state=42, n_init=10)
 client_sales['Cluster'] = kmeans.fit_predict(client_sales[['Ciudad_code', 'Total']])
 
@@ -102,7 +102,6 @@ agg['recencia_dias'] = agg['recencia_dias'].fillna(agg['recencia_dias'].median()
 
 # Mes y trimestre del último registro del cliente (para predicción por cliente)
 agg['mes_ultimo'] = agg['ultima_fecha'].dt.month
-# Si faltó, usa la moda global
 if agg['mes_ultimo'].isna().any():
     moda_mes_global = df['mes'].mode()
     moda_mes_global = int(moda_mes_global.iloc[0]) if len(moda_mes_global) else 1
@@ -146,7 +145,9 @@ X = X.replace([np.inf, -np.inf], np.nan).fillna(0.0).astype(float)
 y = df_model['Total'].astype(float)
 y = y.replace([np.inf, -np.inf], np.nan).fillna(y.median())
 
-# Split con numpy arrays (evita problemas de índices en xgboost)
+# ---------------------------------------------------------------------
+# Split y ENTRENAMIENTO ROBUSTO con XGBoost
+# ---------------------------------------------------------------------
 X_train, X_test, y_train, y_test = train_test_split(
     X.values,
     y.values,
@@ -154,29 +155,52 @@ X_train, X_test, y_train, y_test = train_test_split(
     random_state=42
 )
 
-# ---------------------------------------------------------------------
-# Modelo XGBoost con early stopping y métrica explícita
-# ---------------------------------------------------------------------
+# Convertir a float32 y contiguo en memoria (clave para evitar TypeError)
+X_train = np.ascontiguousarray(X_train, dtype=np.float32)
+X_test  = np.ascontiguousarray(X_test,  dtype=np.float32)
+y_train = np.ascontiguousarray(y_train, dtype=np.float32)
+y_test  = np.ascontiguousarray(y_test,  dtype=np.float32)
+
+# Modelo XGBoost con parámetros conservadores y n_jobs=1
 model = xgb.XGBRegressor(
     random_state=42,
     verbosity=0,
-    n_estimators=2000,        # más árboles pero frenados por early stopping
+    n_estimators=800,        # estable con early stopping
     max_depth=6,
-    learning_rate=0.03,       # tasa baja para generalizar
+    learning_rate=0.05,
     subsample=0.9,
     colsample_bytree=0.9,
     reg_alpha=0.0,
     reg_lambda=1.0,
-    tree_method='hist'
+    tree_method='hist',
+    n_jobs=1                 # evita conflictos de hilos en algunos entornos
 )
 
-model.fit(
-    X_train, y_train,
-    eval_set=[(X_test, y_test)],
-    eval_metric='rmse',
-    verbose=False,
-    early_stopping_rounds=100
-)
+# Entrenamiento con early stopping (envuelto en try/except)
+try:
+    model.fit(
+        X_train, y_train,
+        eval_set=[(X_test, y_test)],
+        eval_metric='rmse',
+        verbose=False,
+        early_stopping_rounds=50
+    )
+except Exception as e:
+    st.warning(f"Entrenamiento con early_stopping falló: {e}. Entrenando sin early_stopping...")
+    model = xgb.XGBRegressor(
+        random_state=42,
+        verbosity=0,
+        n_estimators=800,
+        max_depth=6,
+        learning_rate=0.05,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        reg_alpha=0.0,
+        reg_lambda=1.0,
+        tree_method='hist',
+        n_jobs=1
+    )
+    model.fit(X_train, y_train, verbose=False)
 
 # ---------------------------------------------------------------------
 # UI - Pestañas
@@ -252,7 +276,7 @@ with tab2:
     st.write(f"**RMSE:** ${rmse:,.2f}")
     st.write(f"**R²:** {r2_score(y_test, y_pred):.2f}")
     st.caption(
-        "El modelo usa ciudad, mes, trimestre y agregados RFM por cliente; entrenado con early stopping."
+        "El modelo usa ciudad, mes, trimestre y agregados RFM por cliente; entrenado con early stopping (o sin él si el entorno no lo soporta)."
     )
 
     # ----------------- Predicción personalizada (solo Cliente) -----------------
@@ -297,8 +321,9 @@ with tab2:
 
     input_vector = pd.DataFrame([input_dict]).reindex(columns=X.columns, fill_value=0.0)
 
-    # Predicción (usar .values para mayor compatibilidad)
-    predicted_total = float(model.predict(input_vector.values)[0])
+    # Predicción (usar float32 contiguo para máxima compatibilidad)
+    input_np = np.ascontiguousarray(input_vector.values, dtype=np.float32)
+    predicted_total = float(model.predict(input_np)[0])
     st.write(f"### Monto estimado: ${predicted_total:,.2f}")
 
     # ----------------- Importancia de variables -----------------
