@@ -17,6 +17,19 @@ st.set_page_config(page_title="Dashboard AYMD", layout="wide")
 sns.set(style="whitegrid")
 
 # ---------------------------------------------------------------------
+# Sidebar: Tuning rápido
+# ---------------------------------------------------------------------
+with st.sidebar:
+    st.header("⚙️ Tuning rápido (XGBoost)")
+    eta = st.slider("Learning rate (eta)", 0.01, 0.15, 0.04, 0.01)
+    max_depth = st.slider("Profundidad máxima (max_depth)", 3, 9, 5, 1)
+    n_rounds = st.slider("Num Boost Rounds", 400, 2000, 1200, 50)
+    lambda_l2 = st.slider("Regularización L2 (lambda)", 0.0, 5.0, 2.0, 0.5)
+    min_child_weight = st.slider("min_child_weight", 1.0, 10.0, 3.0, 0.5)
+    early_stop_rounds = st.slider("Early stopping rounds", 30, 200, 70, 10)
+    st.caption("Ajusta y observa cómo cambian las métricas. El modelo se re-entrena al mover los sliders.")
+
+# ---------------------------------------------------------------------
 # Helper para fechas (maneja strings y seriales de Excel)
 # ---------------------------------------------------------------------
 def parse_fecha(series: pd.Series) -> pd.Series:
@@ -34,7 +47,7 @@ def parse_fecha(series: pd.Series) -> pd.Series:
 # ---------------------------------------------------------------------
 df = pd.read_excel("Base-2023-AYMD-OpenRefine (1) 2.xlsx", engine="openpyxl")
 
-# Normalización básica de texto (evita problemas de espacios y mayúsculas)
+# Normalización de texto
 for col in ['Ciudad', 'Vendedor', 'Nombre cliente']:
     df[col] = df[col].astype(str).str.strip().str.lower()
 
@@ -72,7 +85,7 @@ client_sales = (
 )
 client_sales['Ciudad_code'] = client_sales['Ciudad'].astype('category').cat.codes
 
-# KMeans (n_init explícito para evitar warnings)
+# KMeans (n_init explícito)
 kmeans = KMeans(n_clusters=4, random_state=42, n_init=10)
 client_sales['Cluster'] = kmeans.fit_predict(client_sales[['Ciudad_code', 'Total']])
 
@@ -152,20 +165,22 @@ y_log = np.log1p(y)  # log(1 + y) para entrenamiento
 # VALIDACIÓN TEMPORAL (train antes de 1/oct/2023; test desde 1/oct/2023)
 # ---------------------------------------------------------------------
 cutoff = pd.to_datetime("2023-10-01")
-# df_model['Fecha'] existe porque proviene de df en el merge
 train_idx = df_model['Fecha'] < cutoff
 test_idx  = df_model['Fecha'] >= cutoff
 
-# Seguridad: si por algún motivo no hay test, hacemos split aleatorio
-if test_idx.sum() == 0 or train_idx.sum() == 0:
+# Seguridad: si por algún motivo no hay test o train, usamos split aleatorio
+use_random_split = (test_idx.sum() == 0 or train_idx.sum() == 0)
+if use_random_split:
     st.warning("No hay suficientes datos para validación temporal; usando split aleatorio 80/20.")
-    # Split aleatorio sobre y_log
     X_train_df, X_test_df, y_train_s, y_test_s = train_test_split(
         X, y_log, test_size=0.20, random_state=42
     )
+    # Para panel de residuos: usaremos índices del DataFrame
+    test_indices = X_test_df.index
 else:
     X_train_df, X_test_df = X.loc[train_idx], X.loc[test_idx]
     y_train_s, y_test_s   = y_log.loc[train_idx], y_log.loc[test_idx]
+    test_indices = X_test_df.index  # índice original de df_model
 
 # Convertir a float32 contiguo
 X_train = np.ascontiguousarray(X_train_df.values, dtype=np.float32)
@@ -179,17 +194,17 @@ dtrain = xgb.DMatrix(X_train, label=y_train, feature_names=feature_names)
 dvalid = xgb.DMatrix(X_test,  label=y_test_log, feature_names=feature_names)
 
 # ---------------------------------------------------------------------
-# Booster (API nativa) con TUNING CONSERVADOR y early stopping
+# Booster (API nativa) con parámetros del sidebar y early stopping
 # ---------------------------------------------------------------------
 params = {
     "objective": "reg:squarederror",  # sobre y_log
     "eval_metric": "rmse",
-    "eta": 0.04,                 # learning_rate más bajo
-    "max_depth": 5,              # menor profundidad para generalizar mejor
+    "eta": float(eta),                 # learning_rate
+    "max_depth": int(max_depth),
     "subsample": 0.9,
     "colsample_bytree": 0.9,
-    "lambda": 2.0,               # mayor regularización L2
-    "min_child_weight": 3.0,     # evita splits con poco soporte
+    "lambda": float(lambda_l2),        # L2
+    "min_child_weight": float(min_child_weight),
     "tree_method": "hist",
     "nthread": 1,
     "seed": 42
@@ -200,16 +215,16 @@ evals = [(dtrain, "train"), (dvalid, "valid")]
 booster = xgb.train(
     params=params,
     dtrain=dtrain,
-    num_boost_round=1200,          # más rondas; se frenan por early stopping
+    num_boost_round=int(n_rounds),
     evals=evals,
-    early_stopping_rounds=70,
+    early_stopping_rounds=int(early_stop_rounds),
     verbose_eval=False
 )
 
 # ---------------------------------------------------------------------
 # UI - Pestañas
 # ---------------------------------------------------------------------
-tab1, tab2 = st.tabs(["Segmentación de Clientes", "Predicción con XGBoost (Versión A)"])
+tab1, tab2 = st.tabs(["Segmentación de Clientes", "Predicción + Análisis de Errores"])
 
 # ============================== TAB 1 ==============================
 with tab1:
@@ -270,22 +285,24 @@ with tab1:
 
 # ============================== TAB 2 ==============================
 with tab2:
-    st.title("Predicción del Monto de Compra (Validación Temporal + Mes Cíclico)")
+    st.title("Predicción del Monto + Análisis de Errores")
 
-    # ----------------- Métricas del modelo -----------------
-    y_pred_log = booster.predict(dvalid)         # predicciones en escala log
-    y_pred = np.expm1(y_pred_log)                # invertimos a pesos
-    y_test = np.expm1(y_test_log)                # valores reales en pesos
+    # ----------------- Métricas del modelo (en pesos) -----------------
+    y_pred_log = booster.predict(dvalid)  # predicciones en escala log
+    y_pred = np.expm1(y_pred_log)         # invertimos a pesos
+    y_test = np.expm1(y_test_log)         # valores reales en pesos
 
     rmse = float(np.sqrt(np.mean((y_test - y_pred) ** 2)))
     st.subheader("Evaluación del modelo")
     st.write(f"**MAE (en pesos):** ${mean_absolute_error(y_test, y_pred):,.2f}")
     st.write(f"**RMSE (en pesos):** ${rmse:,.2f}")
     st.write(f"**R² (en pesos):** {r2_score(y_test, y_pred):.2f}")
-    st.caption(
-        "Validación temporal (train < 2023-10-01; test >= 2023-10-01). "
-        "Objetivo entrenado en log(1 + Total); métricas reportadas en pesos."
-    )
+
+    if use_random_split:
+        st.caption("Split aleatorio 80/20 (no hubo suficientes filas para validación temporal).")
+    else:
+        st.caption("Validación temporal (train < 2023-10-01; test ≥ 2023-10-01). "
+                   "Objetivo entrenado en log(1 + Total); métricas reportadas en pesos.")
 
     # ----------------- Predicción personalizada (solo Cliente) -----------------
     st.subheader("Predicción personalizada")
@@ -341,8 +358,36 @@ with tab2:
     predicted_total = float(np.expm1(predicted_total_log))
     st.write(f"### Monto estimado: ${predicted_total:,.2f}")
 
+    # ----------------- Análisis de residuos -----------------
+    st.subheader("Análisis de errores (residuos)")
+    # Residuos y DataFrame de evaluación (en pesos)
+    residuos = y_test - y_pred
+    df_eval = pd.DataFrame({
+        "y_real": y_test,
+        "y_pred": y_pred,
+        "residuo": residuos
+    }, index=test_indices)
+
+    # Añadimos contexto (cliente, ciudad, fecha, total real del df_model)
+    cols_ctx = ['Nombre cliente', 'Ciudad', 'Fecha', 'Total']
+    ctx = df_model.loc[test_indices, cols_ctx].copy()
+    df_eval_ctx = ctx.join(df_eval)
+
+    st.markdown("**Top 15 mayores errores absolutos (en pesos)**")
+    top_err = df_eval_ctx.assign(error_abs=lambda d: d["residuo"].abs()) \
+                         .sort_values("error_abs", ascending=False) \
+                         .head(15)
+    st.dataframe(top_err)
+
+    st.markdown("**Histograma de residuos (y_real - y_pred)**")
+    fig_res, ax_res = plt.subplots(figsize=(8, 4))
+    sns.histplot(df_eval_ctx["residuo"], bins=40, kde=True, ax=ax_res)
+    ax_res.set_title("Distribución de residuos")
+    ax_res.set_xlabel("Residuo (pesos)")
+    st.pyplot(fig_res)
+
     # ----------------- Importancia de variables -----------------
-    st.subheader("Importancia de variables")
+    st.subheader("Importancia de variables (gain)")
     score = booster.get_score(importance_type='gain')  # dict: {feature_name: score}
     if len(score) == 0:
         st.info("La importancia de variables no está disponible en este booster.")
@@ -357,10 +402,20 @@ with tab2:
         ax_imp.set_title("Top 20 variables más importantes (gain)")
         st.pyplot(fig_imp)
 
+    # ----------------- Guardar / Descargar modelo -----------------
+    st.subheader("Guardar modelo entrenado")
+    raw = booster.save_raw(raw_format=True)
+    st.download_button(
+        label="⬇️ Descargar booster (XGBoost) .bin",
+        data=raw,
+        file_name="modelo_xgb_aymd.bin",
+        mime="application/octet-stream"
+    )
+
     # ----------------- Diagnóstico rápido -----------------
     with st.expander("Diagnóstico (si algo falla)"):
-        st.write("Filas train:", int(train_idx.sum()) if 'train_idx' in locals() else 'N/A')
-        st.write("Filas test:", int(test_idx.sum()) if 'test_idx' in locals() else 'N/A')
+        st.write("Filas train:", int(train_idx.sum()) if 'train_idx' in locals() and not use_random_split else "Split aleatorio")
+        st.write("Filas test:", int(test_idx.sum()) if 'test_idx' in locals() and not use_random_split else "Split aleatorio")
         st.write("X shape:", X.shape)
         st.write("y (Total) shape:", y.shape)
         st.write("¿Hay NaN en X?", np.isnan(X.values).any())
