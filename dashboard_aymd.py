@@ -1,3 +1,5 @@
+
+# -*- coding: utf-8 -*-
 import pandas as pd
 import streamlit as st
 import seaborn as sns
@@ -8,12 +10,24 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 import xgboost as xgb
 
+# ---------------------------------------------------------------------
 # Cargar datos
+# ---------------------------------------------------------------------
 df = pd.read_excel("Base-2023-AYMD-OpenRefine (1) 2.xlsx", engine="openpyxl")
-df['Ciudad'] = df['Ciudad'].str.strip().str.lower()
 
-# Agrupar por cliente y ciudad
-client_sales = df.groupby(['Nombre cliente', 'Ciudad'])['Total'].sum().reset_index()
+# Normalización básica de texto (evita problemas de espacios y mayúsculas)
+for col in ['Ciudad', 'Vendedor', 'Nombre cliente']:
+    df[col] = df[col].astype(str).str.strip().str.lower()
+
+# ---------------------------------------------------------------------
+# Segmentación (tab 1) - KMeans por ciudad y total
+# ---------------------------------------------------------------------
+client_sales = (
+    df.groupby(['Nombre cliente', 'Ciudad'], as_index=False)['Total']
+      .sum()
+)
+
+# Codificar Ciudad para el scatter (solo para visualización/cluster)
 client_sales['Ciudad_code'] = client_sales['Ciudad'].astype('category').cat.codes
 
 # Clustering
@@ -21,28 +35,66 @@ X_cluster = client_sales[['Ciudad_code', 'Total']]
 kmeans = KMeans(n_clusters=4, random_state=42)
 client_sales['Cluster'] = kmeans.fit_predict(X_cluster)
 
-# Tabs
+# ---------------------------------------------------------------------
+# Modelo XGBoost (tab 2) - usando solo Ciudad y Nombre cliente
+# ---------------------------------------------------------------------
+df_model = df.copy()
+
+# One-hot encoding SOLO para Ciudad y Nombre cliente
+df_encoded = pd.get_dummies(df_model[['Ciudad', 'Nombre cliente']])
+
+X = df_encoded
+y = df_model['Total'].astype(float)
+
+# Train/Test split y entrenamiento
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.20, random_state=42
+)
+
+model = xgb.XGBRegressor(
+    random_state=42,
+    verbosity=0,
+    n_estimators=300,
+    max_depth=6,
+    learning_rate=0.08,
+    subsample=0.9,
+    colsample_bytree=0.9
+)
+model.fit(X_train, y_train)
+
+# ---------------------------------------------------------------------
+# UI - Pestañas
+# ---------------------------------------------------------------------
 tab1, tab2 = st.tabs(["Segmentación de Clientes", "Predicción con XGBoost"])
 
+# ============================== TAB 1 ==============================
 with tab1:
     st.title("Segmentación de Clientes AYMD")
     st.write("Segmentación por ciudad y monto total de compras usando K-Means.")
 
-    selected_cluster = st.selectbox("Selecciona un cluster:", sorted(client_sales['Cluster'].unique()))
+    # Selector de cluster
+    selected_cluster = st.selectbox(
+        "Selecciona un cluster:", sorted(client_sales['Cluster'].unique())
+    )
     filtered_data = client_sales[client_sales['Cluster'] == selected_cluster]
 
     st.subheader("Clientes en el cluster seleccionado")
     st.dataframe(filtered_data[['Nombre cliente', 'Ciudad', 'Total']])
 
     st.subheader("Distribución de clientes por ciudad y monto total")
-    fig, ax = plt.subplots(figsize=(10,6))
-    sns.scatterplot(data=client_sales, x='Ciudad_code', y='Total', hue='Cluster', palette='Set2', ax=ax)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    sns.scatterplot(
+        data=client_sales, x='Ciudad_code', y='Total',
+        hue='Cluster', palette='Set2', ax=ax
+    )
     ax.set_title("Segmentación de clientes")
+    ax.set_xlabel("Código de ciudad")
+    ax.set_ylabel("Total de compras")
     st.pyplot(fig)
 
     st.subheader("Matriz de correlación")
     corr_matrix = client_sales[['Ciudad_code', 'Total', 'Cluster']].corr()
-    fig_corr, ax_corr = plt.subplots(figsize=(8,6))
+    fig_corr, ax_corr = plt.subplots(figsize=(8, 6))
     sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', fmt=".2f", ax=ax_corr)
     st.pyplot(fig_corr)
 
@@ -54,7 +106,10 @@ with tab1:
         st.pyplot(fig_dist)
 
     st.subheader("Relaciones entre variables numéricas")
-    pairplot_fig = sns.pairplot(client_sales[['Ciudad_code', 'Total', 'Cluster']], hue='Cluster', palette='Set2')
+    pairplot_fig = sns.pairplot(
+        client_sales[['Ciudad_code', 'Total', 'Cluster']],
+        hue='Cluster', palette='Set2'
+    )
     st.pyplot(pairplot_fig.fig)
 
     st.subheader("Diagramas de bigotes y violín")
@@ -69,55 +124,58 @@ with tab1:
         ax_violin.set_title(f"Violinplot de {col}")
         st.pyplot(fig_violin)
 
+# ============================== TAB 2 ==============================
 with tab2:
     st.title("Predicción del Monto de Compra con XGBoost")
 
-    # Codificación
-    df_model = df.copy()
-    for col in ['Ciudad', 'Vendedor', 'Nombre cliente']:
-        df_model[col] = df_model[col].str.strip().str.lower()
-    df_encoded = pd.get_dummies(df_model[['Ciudad', 'Vendedor', 'Nombre cliente']])
-    X = df_encoded
-    y = df_model['Total']
-
-    # División y entrenamiento
-    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-    model = xgb.XGBRegressor(random_state=42, verbosity=0)
-    model.fit(X_train, y_train)
-
-    # Métricas
+    # ----------------- Métricas del modelo -----------------
     y_pred = model.predict(X_test)
-    rmse = np.sqrt(mean_squared_error(y_test, y_pred))  # ✅ Corrección aquí
+    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
     st.subheader("Evaluación del modelo")
     st.write(f"**MAE:** ${mean_absolute_error(y_test, y_pred):,.2f}")
     st.write(f"**RMSE:** ${rmse:,.2f}")
     st.write(f"**R²:** {r2_score(y_test, y_pred):.2f}")
 
-    # Predicción personalizada
+    # ----------------- Predicción personalizada -----------------
     st.subheader("Predicción personalizada")
-    ciudad_input = st.selectbox("Ciudad:", sorted(df['Ciudad'].unique()))
-    vendedor_input = st.selectbox("Vendedor:", sorted(df['Vendedor'].unique()))
-    cliente_input = st.selectbox("Cliente:", sorted(df['Nombre cliente'].unique()))
 
+    # Fuente para la UI: dataframe normalizado (df ya está normalizado)
+    df_ui = df.copy()
+
+    # 1) Selección de Ciudad
+    ciudades = sorted(df_ui['Ciudad'].dropna().unique())
+    ciudad_input = st.selectbox("Ciudad:", ciudades, key="sel_ciudad")
+
+    # Filtrar por ciudad
+    df_city = df_ui[df_ui['Ciudad'] == ciudad_input]
+
+    # 2) Selección de Cliente (en cascada por ciudad)
+    clientes = sorted(df_city['Nombre cliente'].dropna().unique())
+    if len(clientes) == 0:
+        st.info("No hay clientes para la ciudad seleccionada. Cambia la ciudad.")
+        st.stop()
+
+    cliente_input = st.selectbox("Cliente:", clientes, key="sel_cliente")
+
+    # Construir vector de entrada (one-hot) consistente con X.columns
     input_dict = {
         f"Ciudad_{ciudad_input}": 1,
-        f"Vendedor_{vendedor_input}": 1,
         f"Nombre cliente_{cliente_input}": 1
     }
-    input_vector = pd.DataFrame([input_dict])
-    input_vector = input_vector.reindex(columns=X.columns, fill_value=0)
+    input_vector = pd.DataFrame([input_dict]).reindex(columns=X.columns, fill_value=0)
 
-    predicted_total = model.predict(input_vector)[0]
+    # Predicción
+    predicted_total = float(model.predict(input_vector)[0])
     st.write(f"### Monto estimado: ${predicted_total:,.2f}")
 
-    # Importancia de variables
+    # ----------------- Importancia de variables -----------------
     st.subheader("Importancia de variables")
     importance_df = pd.DataFrame({
         "Feature": X.columns,
         "Importance": model.feature_importances_
     }).sort_values(by="Importance", ascending=False)
 
-    fig_imp, ax_imp = plt.subplots(figsize=(10,6))
+    fig_imp, ax_imp = plt.subplots(figsize=(10, 6))
     sns.barplot(data=importance_df.head(20), x="Importance", y="Feature", ax=ax_imp)
     ax_imp.set_title("Top 20 variables más importantes")
     st.pyplot(fig_imp)
