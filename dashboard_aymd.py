@@ -146,49 +146,48 @@ y = df_model['Total'].astype(float)
 y = y.replace([np.inf, -np.inf], np.nan).fillna(y.median())
 
 # ---------------------------------------------------------------------
-# Split y ENTRENAMIENTO ROBUSTO con XGBoost
+# Split y ENTRENAMIENTO con API nativa de XGBoost (DMatrix + train)
 # ---------------------------------------------------------------------
-X_train, X_test, y_train, y_test = train_test_split(
-    X.values,
-    y.values,
-    test_size=0.20,
-    random_state=42
+X_train_df, X_test_df, y_train_s, y_test_s = train_test_split(
+    X, y, test_size=0.20, random_state=42
 )
 
-# Convertir a float32 y contiguo en memoria (clave para evitar TypeError)
-X_train = np.ascontiguousarray(X_train, dtype=np.float32)
-X_test  = np.ascontiguousarray(X_test,  dtype=np.float32)
-y_train = np.ascontiguousarray(y_train, dtype=np.float32)
-y_test  = np.ascontiguousarray(y_test,  dtype=np.float32)
+# Convertir a float32 contiguo
+X_train = np.ascontiguousarray(X_train_df.values, dtype=np.float32)
+X_test  = np.ascontiguousarray(X_test_df.values,  dtype=np.float32)
+y_train = np.ascontiguousarray(y_train_s.values,  dtype=np.float32)
+y_test  = np.ascontiguousarray(y_test_s.values,   dtype=np.float32)
 
-# Modelo XGBoost con eval_metric en el CONSTRUCTOR y n_jobs=1
-model = xgb.XGBRegressor(
-    random_state=42,
-    verbosity=0,
-    n_estimators=800,        # estable y rápido
-    max_depth=6,
-    learning_rate=0.05,
-    subsample=0.9,
-    colsample_bytree=0.9,
-    reg_alpha=0.0,
-    reg_lambda=1.0,
-    tree_method='hist',
-    n_jobs=1,
-    eval_metric='rmse'       # ✅ en el constructor
-)
+# DMatrix con nombres de features (garantiza mapeo consistente)
+feature_names = list(X.columns)
+dtrain = xgb.DMatrix(X_train, label=y_train, feature_names=feature_names)
+dvalid = xgb.DMatrix(X_test,  label=y_test,  feature_names=feature_names)
 
-# ----- Early Stopping con CALLBACKS (compatible en todas las builds) -----
-early_stop = xgb.callback.EarlyStopping(
-    rounds=50,            # número de rondas sin mejora
-    save_best=True,       # guarda el mejor modelo
-    maximize=False        # RMSE se minimiza
-)
+# Parámetros del booster (robustos y compatibles)
+params = {
+    "objective": "reg:squarederror",
+    "eval_metric": "rmse",
+    "eta": 0.05,                 # learning_rate
+    "max_depth": 6,
+    "subsample": 0.9,
+    "colsample_bytree": 0.9,
+    "lambda": 1.0,               # L2
+    "alpha": 0.0,                # L1
+    "tree_method": "hist",
+    "nthread": 1,
+    "seed": 42
+}
 
-model.fit(
-    X_train, y_train,
-    eval_set=[(X_test, y_test)],
-    verbose=False,
-    callbacks=[early_stop]  # ✅ usamos callbacks en vez de early_stopping_rounds
+evals = [(dtrain, "train"), (dvalid, "valid")]
+
+# Entrenamiento con early stopping vía xgb.train
+booster = xgb.train(
+    params=params,
+    dtrain=dtrain,
+    num_boost_round=800,           # similar al n_estimators
+    evals=evals,
+    early_stopping_rounds=50,
+    verbose_eval=False
 )
 
 # ---------------------------------------------------------------------
@@ -258,14 +257,16 @@ with tab2:
     st.title("Predicción del Monto de Compra con XGBoost (Mejorado)")
 
     # ----------------- Métricas del modelo -----------------
-    y_pred = model.predict(X_test)
-    rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+    y_pred = booster.predict(dvalid)
+    rmse = float(np.sqrt(np.mean((y_test - y_pred) ** 2)))
     st.subheader("Evaluación del modelo")
     st.write(f"**MAE:** ${mean_absolute_error(y_test, y_pred):,.2f}")
     st.write(f"**RMSE:** ${rmse:,.2f}")
+    # R² (con numpy/metrics)
     st.write(f"**R²:** {r2_score(y_test, y_pred):.2f}")
     st.caption(
-        "El modelo usa ciudad, mes, trimestre y agregados RFM por cliente; entrenado con early stopping mediante callbacks."
+        "Entrenado con API nativa de XGBoost (DMatrix + train) usando early stopping; "
+        "evita incompatibilidades de la API sklearn."
     )
 
     # ----------------- Predicción personalizada (solo Cliente) -----------------
@@ -308,24 +309,29 @@ with tab2:
         "recencia_dias": float(agg_row['recencia_dias']),
     }
 
-    input_vector = pd.DataFrame([input_dict]).reindex(columns=X.columns, fill_value=0.0)
-
-    # Predicción (usar float32 contiguo para máxima compatibilidad)
+    input_vector = pd.DataFrame([input_dict]).reindex(columns=feature_names, fill_value=0.0)
     input_np = np.ascontiguousarray(input_vector.values, dtype=np.float32)
-    predicted_total = float(model.predict(input_np)[0])
+    dinput = xgb.DMatrix(input_np, feature_names=feature_names)
+
+    predicted_total = float(booster.predict(dinput)[0])
     st.write(f"### Monto estimado: ${predicted_total:,.2f}")
 
     # ----------------- Importancia de variables -----------------
     st.subheader("Importancia de variables")
-    importance_df = pd.DataFrame({
-        "Feature": X.columns,
-        "Importance": model.feature_importances_
-    }).sort_values(by="Importance", ascending=False)
+    # importance_type: 'weight' | 'gain' | 'cover' | 'total_gain' | 'total_cover'
+    score = booster.get_score(importance_type='gain')  # dict: {feature_name: score}
+    if len(score) == 0:
+        st.info("La importancia de variables no está disponible en este booster.")
+    else:
+        importance_df = pd.DataFrame({
+            "Feature": list(score.keys()),
+            "Importance": list(score.values())
+        }).sort_values(by="Importance", ascending=False)
 
-    fig_imp, ax_imp = plt.subplots(figsize=(10, 6))
-    sns.barplot(data=importance_df.head(20), x="Importance", y="Feature", ax=ax_imp)
-    ax_imp.set_title("Top 20 variables más importantes")
-    st.pyplot(fig_imp)
+        fig_imp, ax_imp = plt.subplots(figsize=(10, 6))
+        sns.barplot(data=importance_df.head(20), x="Importance", y="Feature", ax=ax_imp)
+        ax_imp.set_title("Top 20 variables más importantes (gain)")
+        st.pyplot(fig_imp)
 
     # ----------------- Diagnóstico rápido -----------------
     with st.expander("Diagnóstico (si algo falla)"):
@@ -336,3 +342,5 @@ with tab2:
         st.write("¿Hay Inf en X?", np.isinf(X.values).any())
         st.write("¿Hay Inf en y?", np.isinf(y.values).any())
         st.write("Primeras 10 columnas de X:", list(X.columns[:10]))
+        st.write("Mejor iteración (early stopping):", booster.best_iteration)
+        st.write("Mejor puntuación (RMSE valid):", booster.best_score)
