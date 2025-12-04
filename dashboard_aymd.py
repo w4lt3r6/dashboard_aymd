@@ -165,7 +165,7 @@ y_test  = np.ascontiguousarray(y_test,  dtype=np.float32)
 model = xgb.XGBRegressor(
     random_state=42,
     verbosity=0,
-    n_estimators=800,        # estable con early stopping
+    n_estimators=800,        # estable y rápido
     max_depth=6,
     learning_rate=0.05,
     subsample=0.9,
@@ -174,15 +174,21 @@ model = xgb.XGBRegressor(
     reg_lambda=1.0,
     tree_method='hist',
     n_jobs=1,
-    eval_metric='rmse'       # ✅ aquí en el constructor (no en fit)
+    eval_metric='rmse'       # ✅ en el constructor
 )
 
-# Entrenamiento con early stopping
+# ----- Early Stopping con CALLBACKS (compatible en todas las builds) -----
+early_stop = xgb.callback.EarlyStopping(
+    rounds=50,            # número de rondas sin mejora
+    save_best=True,       # guarda el mejor modelo
+    maximize=False        # RMSE se minimiza
+)
+
 model.fit(
     X_train, y_train,
     eval_set=[(X_test, y_test)],
     verbose=False,
-    early_stopping_rounds=50  # ✅ se mantiene en fit
+    callbacks=[early_stop]  # ✅ usamos callbacks en vez de early_stopping_rounds
 )
 
 # ---------------------------------------------------------------------
@@ -259,7 +265,7 @@ with tab2:
     st.write(f"**RMSE:** ${rmse:,.2f}")
     st.write(f"**R²:** {r2_score(y_test, y_pred):.2f}")
     st.caption(
-        "El modelo usa ciudad, mes, trimestre y agregados RFM por cliente; entrenado con early stopping."
+        "El modelo usa ciudad, mes, trimestre y agregados RFM por cliente; entrenado con early stopping mediante callbacks."
     )
 
     # ----------------- Predicción personalizada (solo Cliente) -----------------
@@ -330,4 +336,3 @@ with tab2:
         st.write("¿Hay Inf en X?", np.isinf(X.values).any())
         st.write("¿Hay Inf en y?", np.isinf(y.values).any())
         st.write("Primeras 10 columnas de X:", list(X.columns[:10]))
-        st.write("Mejor iteración del modelo:", getattr(model, "best_iteration", None))
